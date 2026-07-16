@@ -14,7 +14,7 @@ import {
   normalizeFilePathForIndex,
   selectNewImportableFiles,
 } from '@/services/bookService';
-import { navigateToLibrary, navigateToLogin, navigateToReader } from '@/utils/nav';
+import { navigateToLibrary, navigateToReader } from '@/utils/nav';
 import { getCoverFilename, getBookWithUpdatedMetadata, listFormater } from '@/utils/book';
 import { getImportErrorMessage } from '@/services/errors';
 import { ingestFile } from '@/services/ingestService';
@@ -37,7 +37,6 @@ import { useTranslation } from '@/hooks/useTranslation';
 import { useLibraryStore } from '@/store/libraryStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { useResponsiveSize } from '@/hooks/useResponsiveSize';
-import { usePullToRefresh } from '@/hooks/usePullToRefresh';
 import { useTheme } from '@/hooks/useTheme';
 import { useUICSS } from '@/hooks/useUICSS';
 import { useDemoBooks } from './hooks/useDemoBooks';
@@ -46,7 +45,6 @@ import { useLibraryFileSync } from './hooks/useLibraryFileSync';
 import { useBookTransferActions } from './hooks/useBookTransferActions';
 import { useAutoImportFolders } from './hooks/useAutoImportFolders';
 import { useInboxDrainer } from '@/hooks/useInboxDrainer';
-import { useOPDSSubscriptions } from '@/hooks/useOPDSSubscriptions';
 import { useBookDataStore } from '@/store/bookDataStore';
 import { useTransferStore } from '@/store/transferStore';
 import { useBackgroundTexture } from '@/hooks/useBackgroundTexture';
@@ -301,29 +299,9 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
   // Google Drive): keeps library.json current on import / delete / book-close,
   // parity with useBooksSync. No-op when no provider is enabled.
   useLibraryFileSync();
-  const { checkOPDSSubscriptions } = useOPDSSubscriptions();
   useInboxDrainer();
   const { isDragging } = useDragDropImport();
 
-  usePullToRefresh(
-    scrollRef,
-    async () => {
-      if (!user) {
-        navigateToLogin(router);
-        return;
-      }
-      await pullLibrary(false, true);
-      checkOPDSSubscriptions(true);
-    },
-    async () => {
-      if (!user) {
-        navigateToLogin(router);
-        return;
-      }
-      await pullLibrary(true, true);
-      checkOPDSSubscriptions(true);
-    },
-  );
   useShortcuts({
     onToggleFullscreen: async () => {
       if (isTauriAppPlatform()) {
