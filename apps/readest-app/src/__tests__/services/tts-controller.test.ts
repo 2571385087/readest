@@ -26,6 +26,16 @@ vi.mock('@/services/tts/NativeTTSClient', () => ({
   }),
 }));
 
+// Track the inaudible background keep-alive (WebAudio) toggled for direct-speak
+// engines. Arrow closures so the vi.mock hoist never hits a TDZ on these consts.
+const startKeepAlive = vi.fn();
+const stopKeepAlive = vi.fn();
+vi.mock('@/services/tts/WebAudioPlayer', async (importActual) => ({
+  ...(await importActual<typeof import('@/services/tts/WebAudioPlayer')>()),
+  startAudioKeepAlive: () => startKeepAlive(),
+  stopAudioKeepAlive: () => stopKeepAlive(),
+}));
+
 vi.mock('@/services/tts/TTSUtils', () => ({
   TTSUtils: {
     getPreferredClient: vi.fn().mockReturnValue(null),
@@ -162,6 +172,15 @@ describe('TTSController', () => {
   let mockView: FoliateView;
   let mockAppService: AppService;
 
+  // Controllers that kick off a detached `#speak` loop (the native-TTS tests
+  // start speak() un-awaited and only assert on an early side-effect). They
+  // must be stopped after the test, or the loop keeps running past teardown
+  // and its deferred `set state` dispatch — queueMicrotask(() =>
+  // dispatchEvent(new CustomEvent(...))) — fires once the jsdom env is gone,
+  // where `CustomEvent` is Node's global rather than jsdom's and jsdom's
+  // EventTarget rejects it as "parameter 1 is not of type 'Event'" (#5149).
+  const speakingControllers: TTSController[] = [];
+
   beforeEach(() => {
     vi.clearAllMocks();
     mockView = createMockView();
@@ -178,6 +197,19 @@ describe('TTSController', () => {
     } catch {
       // ignore
     }
+    // Abort any detached speak loop started on a locally-created controller so
+    // no trailing state change escapes into env teardown (see speakingControllers).
+    for (const c of speakingControllers) {
+      try {
+        await c.stop();
+      } catch {
+        // ignore
+      }
+    }
+    speakingControllers.length = 0;
+    // Flush the deferred set-state dispatch microtasks while the jsdom realm
+    // is still alive.
+    await new Promise((resolve) => setTimeout(resolve, 0));
     vi.restoreAllMocks();
   });
 
@@ -1183,6 +1215,7 @@ describe('TTSController', () => {
       await c.init();
       c.ttsClient = c.ttsNativeClient!;
       await c.initViewTTS(0);
+      speakingControllers.push(c);
       return c;
     };
 
@@ -1247,6 +1280,74 @@ describe('TTSController', () => {
       await new Promise((r) => setTimeout(r, 150));
       expect(c.state).not.toBe('playing');
       expect(state.attempts).toBeLessThanOrEqual(10);
+    });
+  });
+
+  describe('native TTS background keep-alive (#4408)', () => {
+    // Android controller whose ACTIVE client is the direct-speak native engine
+    // (mediaClock === false): its audio renders in the OS, not the WebView.
+    const makeAndroidNativeController = async () => {
+      const c = new TTSController(createMockAppService(true), mockView);
+      await c.init();
+      c.ttsClient = c.ttsNativeClient!;
+      await c.initViewTTS(0);
+      speakingControllers.push(c);
+      return c;
+    };
+
+    test('starts an inaudible keep-alive when native TTS begins playing on Android', async () => {
+      const c = await makeAndroidNativeController();
+      vi.spyOn(c, 'forward').mockResolvedValue();
+
+      c.speak('<speak>hello</speak>');
+
+      await vi.waitFor(() => expect(startKeepAlive).toHaveBeenCalled(), { timeout: 5000 });
+      expect(c.state).toBe('playing');
+      expect(stopKeepAlive).not.toHaveBeenCalled();
+    });
+
+    test('does not keep the WebView awake for a buffered (Edge) engine — it emits its own audio', async () => {
+      const c = await makeAndroidNativeController();
+      c.ttsClient = c.ttsEdgeClient; // mediaClock === true
+      vi.spyOn(c, 'forward').mockResolvedValue();
+
+      c.speak('<speak>hello</speak>');
+
+      await vi.waitFor(() => expect(c.state).toBe('playing'), { timeout: 5000 });
+      expect(startKeepAlive).not.toHaveBeenCalled();
+    });
+
+    test('does not start the keep-alive off Android', async () => {
+      // Default controller: appService.isAndroidApp === false, web engine.
+      await controller.initViewTTS(0);
+      vi.spyOn(controller, 'forward').mockResolvedValue();
+
+      controller.speak('<speak>hello</speak>');
+
+      await vi.waitFor(() => expect(controller.state).toBe('playing'), { timeout: 5000 });
+      expect(startKeepAlive).not.toHaveBeenCalled();
+    });
+
+    test('stops the keep-alive when playback is paused', async () => {
+      const c = await makeAndroidNativeController();
+      vi.spyOn(c, 'forward').mockResolvedValue();
+      c.speak('<speak>hello</speak>');
+      await vi.waitFor(() => expect(startKeepAlive).toHaveBeenCalled(), { timeout: 5000 });
+
+      await c.pause();
+
+      expect(stopKeepAlive).toHaveBeenCalled();
+    });
+
+    test('stops the keep-alive on shutdown', async () => {
+      const c = await makeAndroidNativeController();
+      vi.spyOn(c, 'forward').mockResolvedValue();
+      c.speak('<speak>hello</speak>');
+      await vi.waitFor(() => expect(startKeepAlive).toHaveBeenCalled(), { timeout: 5000 });
+
+      await c.shutdown();
+
+      expect(stopKeepAlive).toHaveBeenCalled();
     });
   });
 
