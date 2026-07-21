@@ -229,7 +229,11 @@ jobs:
       - name: install NDK (for Android build only)
         if: matrix.config.release == 'android'
         run: sdkmanager "ndk;28.2.13676358"
-
+        
+      - name: accept Android licenses
+        if: matrix.config.release == 'android'
+        run: yes | sdkmanager --licenses
+        
       - name: install dependencies
         run: pnpm install --frozen-lockfile --prefer-offline
 
