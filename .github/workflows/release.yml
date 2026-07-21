@@ -192,29 +192,29 @@ jobs:
           - os: ubuntu-latest
             release: android
             rust_target: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
-          - os: ubuntu-22.04
-            release: linux
-            arch: x86_64
-            rust_target: x86_64-unknown-linux-gnu
-          - os: ubuntu-22.04-arm
-            release: linux
-            arch: aarch64
-            rust_target: aarch64-unknown-linux-gnu
-          - os: macos-latest
-            release: macos
-            arch: aarch64
-            rust_target: x86_64-apple-darwin,aarch64-apple-darwin
-            args: '--target universal-apple-darwin'
+#          - os: ubuntu-22.04
+#            release: linux
+#            arch: x86_64
+#            rust_target: x86_64-unknown-linux-gnu
+#          - os: ubuntu-22.04-arm
+#            release: linux
+#            arch: aarch64
+#            rust_target: aarch64-unknown-linux-gnu
+#          - os: macos-latest
+#            release: macos
+#            arch: aarch64
+#            rust_target: x86_64-apple-darwin,aarch64-apple-darwin
+#            args: '--target universal-apple-darwin'
           - os: windows-latest
             release: windows
             arch: x86_64
             rust_target: x86_64-pc-windows-msvc
             args: '--target x86_64-pc-windows-msvc --bundles nsis'
-          - os: windows-latest
-            release: windows
-            arch: aarch64
-            rust_target: aarch64-pc-windows-msvc
-            args: '--target aarch64-pc-windows-msvc --bundles nsis'
+#          - os: windows-latest
+#            release: windows
+#            arch: aarch64
+#            rust_target: aarch64-pc-windows-msvc
+#            args: '--target aarch64-pc-windows-msvc --bundles nsis'
 
     runs-on: ${{ matrix.config.os }}
     timeout-minutes: 60
@@ -252,7 +252,7 @@ jobs:
         run: pnpm install --frozen-lockfile --prefer-offline
 
       - name: copy pdfjs-dist and simplecc-dist to public directory
-        run: pnpm --filter @2571385087/readest-app setup-vendors
+        run: pnpm --filter @readest/readest-app setup-vendors
 
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
