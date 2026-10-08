@@ -1,0 +1,347 @@
+# Fork release pipeline: Windows x64 and Android arm64-v8a only.
+#
+# Upstream's release.yml builds six legs (android/linux/macos/windows), attests
+# provenance, mirrors to Cloudflare R2 and posts to Discord. This fork build
+# keeps just the two legs it ships and drops every upstream-only dependency:
+#
+#   - No hard-coded readest/readest references. Every API call and release URL
+#     resolves through ${{ github.repository }} / $GITHUB_REPOSITORY, so all
+#     releases and assets land in 2571385087/readest.
+#   - No attest-build-provenance (needs id-token + a public repo), no R2 upload,
+#     no Discord notification, no updater latest.json.
+#   - Signing is optional. Without TAURI_SIGNING_PRIVATE_KEY the desktop build
+#     runs with --no-sign instead of failing (tauri.conf.json pins
+#     plugins > updater > pubkey, so the CLI otherwise demands a private key),
+#     and the APK is left unsigned.
+#
+# In-app updates are NOT wired up here. tauri.conf.json pins plugins > updater
+# (pubkey + endpoints) and src/services/constants.ts pins download.readest.com,
+# so a fork that wants the built-in updater must repoint both and publish its
+# own signed latest.json; this workflow only ships installable artifacts.
+#
+# Optional secrets (Settings -> Secrets and variables -> Actions):
+#   TAURI_SIGNING_PRIVATE_KEY           updater signing key STRING, as printed
+#                                       by `pnpm tauri signer generate`
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  password for that key (empty if none)
+#   ANDROID_KEY_ALIAS                   keystore alias
+#   ANDROID_KEY_PASSWORD                keystore/key password
+#   ANDROID_KEY_BASE64                  the .jks keystore, base64-encoded
+#   NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY
+#   NEXT_PUBLIC_POSTHOG_KEY / NEXT_PUBLIC_POSTHOG_HOST
+#   SENTRY_DSN / SENTRY_AUTH_TOKEN
+# The NEXT_PUBLIC_* and SENTRY_* ones are optional: without them the build falls
+# back to the values committed in apps/readest-app/.env, and the Sentry
+# source-map upload no-ops.
+name: Release Fork (Windows x64 + Android arm64-v8a)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to create/update, e.g. v0.12.12. Empty = v<package version>.'
+        required: false
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: resolve version and tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./apps/readest-app/package.json').version")
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${{ github.ref_name }}"
+          else
+            tag="${{ inputs.tag }}"
+          fi
+          if [ -z "$tag" ]; then
+            tag="v${version}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Building Readest $version for ${{ github.repository }} as release $tag"
+
+  build-windows:
+    needs: prepare
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: setup node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: install dependencies
+        run: |
+          pnpm install --frozen-lockfile --prefer-offline
+          pnpm --filter @readest/readest-app setup-vendors
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: fork-windows-x86_64-cargo
+
+      - name: create .env.local
+        shell: bash
+        run: |
+          echo "NEXT_PUBLIC_POSTHOG_KEY=${{ secrets.NEXT_PUBLIC_POSTHOG_KEY }}" >> .env.local
+          echo "NEXT_PUBLIC_POSTHOG_HOST=${{ secrets.NEXT_PUBLIC_POSTHOG_HOST }}" >> .env.local
+          echo "NEXT_PUBLIC_SUPABASE_URL=${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}" >> .env.local
+          echo "NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}" >> .env.local
+          echo "NEXT_PUBLIC_APP_PLATFORM=tauri" >> .env.local
+          echo "SENTRY_DSN=${{ secrets.SENTRY_DSN }}" >> .env.local
+          echo "SENTRY_AUTH_TOKEN=${{ secrets.SENTRY_AUTH_TOKEN }}" >> .env.local
+          cp .env.local apps/readest-app/.env.local
+
+      # Bundles land in the REPO-ROOT target/ dir (cargo workspace), so every
+      # artifact path below is relative to the repository root.
+      - name: build NSIS installer (x64)
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          NODE_OPTIONS: '--max-old-space-size=8192'
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          args=(--target x86_64-pc-windows-msvc --bundles nsis)
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY is not set: building with --no-sign, no updater .sig will be produced."
+            args+=(--no-sign)
+          fi
+
+          pushd apps/readest-app
+          pnpm tauri build "${args[@]}"
+          popd
+
+          # The portable rebuild below overwrites this installer, so stage the
+          # clean copy first (same trap as upstream's nightly workflow).
+          mkdir -p dist
+          nsis="target/x86_64-pc-windows-msvc/release/bundle/nsis/Readest_${version}_x64-setup.exe"
+          cp "$nsis" dist/
+          if [ -f "$nsis.sig" ]; then cp "$nsis.sig" dist/; fi
+
+      - name: build portable exe (x64)
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          NODE_OPTIONS: '--max-old-space-size=8192'
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          args=(--target x86_64-pc-windows-msvc --bundles nsis)
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            args+=(--no-sign)
+          fi
+
+          echo "NEXT_PUBLIC_PORTABLE_APP=true" >> apps/readest-app/.env.local
+          pushd apps/readest-app
+          pnpm tauri build "${args[@]}"
+          popd
+
+          bin_file="dist/Readest_${version}_x64-portable.exe"
+          cp "target/x86_64-pc-windows-msvc/release/readest.exe" "$bin_file"
+
+          if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            # `tauri build` accepts the key as a string or a path; `signer sign`
+            # only takes the string, so resolve a path to its contents here.
+            key="$TAURI_SIGNING_PRIVATE_KEY"
+            if [ -f "$key" ]; then key="$(cat "$key")"; fi
+            pushd apps/readest-app
+            pnpm tauri signer sign -k "$key" -p "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" "../../$bin_file"
+            popd
+          fi
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-x64
+          path: dist/*
+          if-no-files-found: error
+
+  build-android:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Compiling the Rust library for arm64 plus the frontend and Gradle runs
+    # long; upstream caps its Android step at 90 minutes. The job backstop sits
+    # above the step timeout so setup time cannot cancel the leg early.
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+
+      - name: setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: setup node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: setup Java
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: setup Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
+        with:
+          # The legacy `tools` package (part of the action's default) no longer
+          # exists in the SDK repository and makes sdkmanager fail.
+          packages: 'platform-tools'
+
+      - name: install NDK
+        run: sdkmanager "ndk;28.2.13676358"
+
+      - name: install dependencies
+        run: |
+          pnpm install --frozen-lockfile --prefer-offline
+          pnpm --filter @readest/readest-app setup-vendors
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          # arm64-v8a only: the APK is built with `-t aarch64`.
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: fork-android-aarch64-cargo
+
+      - name: create .env.local
+        shell: bash
+        run: |
+          echo "NEXT_PUBLIC_POSTHOG_KEY=${{ secrets.NEXT_PUBLIC_POSTHOG_KEY }}" >> .env.local
+          echo "NEXT_PUBLIC_POSTHOG_HOST=${{ secrets.NEXT_PUBLIC_POSTHOG_HOST }}" >> .env.local
+          echo "NEXT_PUBLIC_SUPABASE_URL=${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}" >> .env.local
+          echo "NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}" >> .env.local
+          echo "NEXT_PUBLIC_APP_PLATFORM=tauri" >> .env.local
+          echo "SENTRY_DSN=${{ secrets.SENTRY_DSN }}" >> .env.local
+          echo "SENTRY_AUTH_TOKEN=${{ secrets.SENTRY_AUTH_TOKEN }}" >> .env.local
+          cp .env.local apps/readest-app/.env.local
+
+      - name: build arm64-v8a APK
+        shell: bash
+        timeout-minutes: 90
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+          NODE_OPTIONS: '--max-old-space-size=8192'
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          dist="$GITHUB_WORKSPACE/dist"
+          cd apps/readest-app
+
+          # Regenerate the Android project from the Tauri template, then restore
+          # the tracked customizations (the strip task and storeFlavor logic in
+          # gen/android/app/build.gradle.kts) that `init` overwrites.
+          rm -rf src-tauri/gen/android
+          pnpm tauri android init
+          pnpm tauri icon ../../data/icons/readest-book.png
+          git checkout .
+
+          # Without a keystore Gradle emits app-universal-release-unsigned.apk,
+          # which Android refuses to install.
+          if [ -n "${{ secrets.ANDROID_KEY_BASE64 }}" ]; then
+            pushd src-tauri/gen/android
+            echo "keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}" > keystore.properties
+            echo "password=${{ secrets.ANDROID_KEY_PASSWORD }}" >> keystore.properties
+            base64 -d <<< "${{ secrets.ANDROID_KEY_BASE64 }}" > "$RUNNER_TEMP/keystore.jks"
+            echo "storeFile=$RUNNER_TEMP/keystore.jks" >> keystore.properties
+            popd
+          else
+            echo "::warning::ANDROID_KEY_BASE64 is not set: the APK will be UNSIGNED and cannot be installed."
+          fi
+
+          # `-t aarch64` restricts the Rust targets and the APK's ABI list
+          # (-PabiList=arm64-v8a), while the flavor keeps its "universal" name,
+          # so the output path still ends in apk/universal/release/.
+          pnpm tauri android build --apk -t aarch64
+
+          mkdir -p "$dist"
+          cp src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release*.apk \
+            "$dist/Readest_${version}_arm64.apk"
+
+      - name: verify the APK ships arm64-v8a only
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk=$(ls dist/*.apk)
+          echo "APK: $apk"
+          unzip -l "$apk" | grep -q 'lib/arm64-v8a/' || { echo "::error::no arm64-v8a libraries in $apk"; exit 1; }
+          if unzip -l "$apk" | grep -qE 'lib/(armeabi-v7a|x86|x86_64)/'; then
+            echo "::error::$apk contains ABIs other than arm64-v8a"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android-arm64
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [prepare, build-windows, build-android]
+    runs-on: ubuntu-latest
+    permissions:
+      # gh release create/upload needs to write releases in this repository.
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: publish release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Readest ${VERSION} (fork)" \
+              --notes "Fork build for ${GITHUB_REPOSITORY}: Windows x64 (NSIS installer + portable exe) and Android arm64-v8a APK."
+          fi
+          echo "Assets are at https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
