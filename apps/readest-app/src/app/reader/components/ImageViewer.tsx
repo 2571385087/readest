@@ -9,6 +9,7 @@ import { Insets } from '@/types/misc';
 import { eventDispatcher } from '@/utils/event';
 import { canShareText } from '@/utils/share';
 import { dataUrlToBytes, imageExtensionFromMime } from '@/utils/image';
+import { mountWhiteTransparencyFilter } from '@/utils/imageBackground';
 import {
   isLightColor,
   probeImageInk,
@@ -131,6 +132,9 @@ const ImageViewer: React.FC<ImageViewerProps> = ({
     setPixelPerfectScale(img.naturalWidth / (fitWidth * dpr));
   }, []);
 
+  // The page's filter, copied below, names its definition by id.
+  useEffect(() => mountWhiteTransparencyFilter(document), []);
+
   // A cached image can already be decoded before the load event would fire, and
   // rotating the device or resizing the window changes the fit size.
   useEffect(() => {
@@ -228,7 +232,15 @@ const ImageViewer: React.FC<ImageViewerProps> = ({
   const handleKeyDown = (e: React.KeyboardEvent) => {
     e.stopPropagation();
 
-    // Escape is handled by useKeyDownActions (also covers Android Back key).
+    // The viewer takes focus when it opens, so Escape starts here, and the
+    // line above keeps it from useKeyDownActions' window listener. Closing
+    // here also keeps Escape from a dialog underneath, such as book details
+    // under the cover viewer.
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      onClose();
+      return;
+    }
 
     // Arrow key navigation
     if (e.key === 'ArrowLeft' && onPrevious) {

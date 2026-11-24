@@ -17,6 +17,7 @@ import type { DictionarySettings, ImportedDictionary } from '@/services/dictiona
 export type ThemeType = 'light' | 'dark' | 'auto';
 export type LibraryViewModeType = 'grid' | 'list';
 export const LibrarySortByType = {
+  Custom: 'custom',
   Title: 'title',
   Author: 'author',
   Updated: 'updated',
@@ -40,6 +41,16 @@ export type LibrarySortByType = (typeof LibrarySortByType)[keyof typeof LibraryS
  * `resolveEffectiveSecondarySort`.
  */
 export type LibrarySecondarySortByType = LibrarySortByType | 'none';
+
+export type LibraryMetadataSortByType = Exclude<
+  LibrarySortByType,
+  typeof LibrarySortByType.Custom | typeof LibrarySortByType.Size
+>;
+
+export interface LibrarySortCriterion {
+  by: LibraryMetadataSortByType;
+  ascending: boolean;
+}
 
 export type LibraryCoverFitType = 'crop' | 'fit';
 
@@ -124,6 +135,12 @@ export interface BookOrbitSettings {
   username: string;
   userkey: string;
   password?: string;
+  /**
+   * BookOrbit 3.8+ API key for the audiobook API. When set, it is sent as the
+   * bearer instead of signing in with `password`; KOReader sync still uses
+   * `username` and `userkey`, which BookOrbit's KOReader routes require.
+   */
+  apiKey?: string;
   deviceId: string;
   deviceName: string;
   strategy: KOSyncStrategy;
@@ -545,6 +562,12 @@ export interface SystemSettings {
   bookshelves?: BookshelfState;
   libraryViewMode: LibraryViewModeType;
   librarySortBy: LibrarySortByType;
+  /**
+   * Custom order picked in the View menu. Kept out of `librarySortBy`, which
+   * stays a metadata sort: releases before custom order give every shelf with
+   * an unknown sort no books, so a downgrade would open on an empty library.
+   */
+  librarySortCustom?: boolean;
   librarySortAscending: boolean;
   /**
    * Whether the primary sort uses a smart default derived from `libraryGroupBy`.
@@ -557,6 +580,8 @@ export interface SystemSettings {
   libraryThenSortBy: LibrarySecondarySortByType;
   /** Sort order of the secondary ("Then by") key, independent of `librarySortAscending` (#5119). */
   libraryThenSortAscending: boolean;
+  /** Ordered list of unique metadata sort criteria (highest priority first) with per-criterion direction. */
+  librarySortOrder?: LibrarySortCriterion[];
   libraryGroupBy: LibraryGroupByType;
   libraryCoverFit: LibraryCoverFitType;
   libraryAutoColumns: boolean;
@@ -601,6 +626,7 @@ export interface SystemSettings {
   metadataSeriesCollapsed: boolean;
   metadataOthersCollapsed: boolean;
   metadataDescriptionCollapsed: boolean;
+  metadataStatsCollapsed: boolean;
   lastSyncedAtBooks: number;
   lastSyncedAtConfigs: number;
   lastSyncedAtNotes: number;
@@ -648,6 +674,12 @@ export interface SystemSettings {
    * distinct identifier semantics and rotation policies.
    */
   replicaDeviceId?: string;
+  /**
+   * iOS only: copy of the device-bound keychain anchor. When it differs from
+   * the keychain, settings.json came from another device and the sync device
+   * IDs above are replaced (#7558).
+   */
+  deviceAnchor?: string;
   /**
    * Per-kind cursor for replica sync. Stores the HLC string of the last
    * pulled row per kind. Absent kinds pull from the beginning.

@@ -274,6 +274,7 @@ export const DEFAULT_SYSTEM_SETTINGS: Partial<SystemSettings> = {
   metadataSeriesCollapsed: false,
   metadataOthersCollapsed: false,
   metadataDescriptionCollapsed: false,
+  metadataStatsCollapsed: false,
 
   pinCodeEnabled: false,
 
@@ -517,6 +518,7 @@ export const DEFAULT_VIEW_CONFIG: ViewConfig = {
   showRemainingPages: false,
   showProgressInfo: true,
   showStickyProgressBar: false,
+  solidScrolledFooter: false,
   showCurrentTime: false,
   showCurrentBatteryStatus: false,
   showBatteryPercentage: true,
@@ -1038,6 +1040,10 @@ export const SYNC_PROGRESS_INTERVAL_SEC = 3;
 export const SYNC_NOTES_INTERVAL_SEC = 5;
 export const SYNC_BOOKS_INTERVAL_SEC = 5;
 export const CHECK_UPDATE_INTERVAL_SEC = 24 * 60 * 60;
+// A manual update check that hasn't answered by then reports an error, which
+// shows for UPDATE_ERROR_DISPLAY_MS before the Check Update button returns.
+export const CHECK_UPDATE_TIMEOUT_MS = 15_000;
+export const UPDATE_ERROR_DISPLAY_MS = 5_000;
 
 export const MAX_ZOOM_LEVEL = 500;
 export const MIN_ZOOM_LEVEL = 50;

@@ -21,6 +21,7 @@ import { readStoredAmbientIsDarkMode } from './ambientLight';
 import { INLINE_FORMATTING_SELECTOR } from './inlineTags';
 import { getOSPlatform } from './misc';
 import { WHITE_TRANSPARENCY_FILTER } from './imageBackground';
+import { classifyAndTagStandaloneDiagrams } from './imageClassifier';
 import {
   LINK_HIT_AREA_CLASS,
   LINK_HIT_AREA_PX,
@@ -312,15 +313,18 @@ const getDialogueHighlightStyles = (viewSettings: ViewSettings, themeCode: Theme
       : viewSettings.dialogueHighlightWeight === 'bold'
         ? '\n    font-weight: bold !important;'
         : '';
+  // Without a background the clone repeats nothing, and iOS 16's WebKit
+  // stops wrapping a line that holds a cloned inline (#7765).
+  const clone = bgBase
+    ? '\n    box-decoration-break: clone;\n    -webkit-box-decoration-break: clone;'
+    : '';
   return `
   /* Dialogue lines tinted with the custom color or, by default, the theme's
      primary color. !important so the tint survives "Override Book Color",
      which repaints spans/paragraphs with the theme background at the same
      importance level but lower specificity. */
   .readest-dialogue {${bgDecl(22)}${text}${weight}
-    border-radius: 0.2em;
-    box-decoration-break: clone;
-    -webkit-box-decoration-break: clone;
+    border-radius: 0.2em;${clone}
   }
   .readest-dialogue-block {${bgDecl(12)}${text}${weight}
     border-radius: 0.3em;
@@ -330,9 +334,7 @@ const getDialogueHighlightStyles = (viewSettings: ViewSettings, themeCode: Theme
   /* Italic runs marked like quoted dialogue; nested marks drop their own
      tint so overlapping translucent backgrounds don't stack. */
   :is(i, em) {${bgDecl(22)}${text}${weight}
-    border-radius: 0.2em;
-    box-decoration-break: clone;
-    -webkit-box-decoration-break: clone;
+    border-radius: 0.2em;${clone}
   }
   :is(i, em) :is(i, em, .readest-dialogue), .readest-dialogue :is(i, em) {
     background-color: transparent !important;
@@ -364,6 +366,9 @@ const getColorStyles = (
   // Over a background texture, Override Book Color still forces the text
   // colors but fills backgrounds with transparent so the texture shows (#6712).
   const overrideBg = hasBackgroundTexture ? 'transparent' : bg;
+  // Tables keep the darker tint they get in dark mode (see `blockquote, table *`).
+  const tableBg =
+    hasBackgroundTexture || !isDarkMode ? overrideBg : `color-mix(in srgb, ${bg} 80%, #000)`;
   const colorStyles = `
     html {
       --bg-texture-id: ${backgroundTextureId};
@@ -396,9 +401,40 @@ const getColorStyles = (
     }
     pre, span { /* inline code blocks */
       ${overrideColor ? `background-color: ${overrideBg} !important;` : ''}
+    }${
+      overrideColor
+        ? `
+    /* A book's own cell, row and column colors and background images give
+       way too (#7415). Whatever sits inside a cell is transparent, so it shows
+       the cell's color (or the texture) instead of a second shade behind the
+       text, and inherits its text color (the theme color from the cell, the
+       link color inside a link), so white text set for a dark cell stays
+       readable. The cell rule ties on specificity with p, span and pre above,
+       so it must come after them. */
+    table, colgroup, col, thead, tbody, tfoot, tr, th, td, caption {
+      background-color: ${tableBg} !important;
+      background-image: none !important;
+      color: ${fg} !important;
+      border-color: ${fg} !important;
+    }
+    :is(th, td, caption) * {
+      background-color: transparent !important;
+      color: inherit !important;
+    }`
+        : ''
     }
     a:any-link {
       ${overrideColor ? `color: ${primary} !important;` : isDarkMode ? `color: lightblue;` : ''}
+    }${
+      overrideColor
+        ? `
+    /* the text color above must not reach a link's own text, such as a
+       footnote marker wrapped in a span (#7573) */
+    a:any-link :is(section, aside, blockquote, article, nav, header, footer, main, figure,
+    div, p, font, h1, h2, h3, h4, h5, h6, li, span) {
+      color: inherit !important;
+    }`
+        : ''
     }
     /* left off hovered links, so a book's own a:hover style applies (#6859) */
     a:any-link:where(:not(:hover)) {
@@ -434,12 +470,42 @@ const getColorStyles = (
     p[width][height] > img:only-child {
       mix-blend-mode: multiply;
     }
-    /* inline images */
+    /* inline images and gaiji */
     *:has(> img.has-text-siblings):not(body) {
-      ${overrideColor ? `background-color: ${bg};` : ''}
+      ${overrideColor ? `background-color: ${overrideBg};` : ''}
     }
-    p img.has-text-siblings, span img.has-text-siblings, sup img.has-text-siblings {
+    *:has(> img[class*="gaiji"]):not(body) {
+      ${overrideColor ? `background-color: ${overrideBg};` : ''}
+    }
+    p img.has-text-siblings,
+    span img.has-text-siblings,
+    sup img.has-text-siblings,
+    img.has-text-siblings,
+    img[class*="gaiji"] {
+      ${
+        isDarkMode && !invertImgColorInDark
+          ? `filter: ${transparentImageBackground ? `${WHITE_TRANSPARENCY_FILTER} ` : ''}invert(1) hue-rotate(180deg);`
+          : ''
+      }
       mix-blend-mode: ${isDarkMode ? 'screen' : 'multiply'};
+    }
+    ${
+      isDarkMode
+        ? `*:has(> img.monochrome-diagram):not(body) {
+      ${overrideColor ? `background-color: ${overrideBg};` : ''}
+    }
+    img.monochrome-diagram {
+      ${
+        !invertImgColorInDark
+          ? `filter: ${transparentImageBackground ? `${WHITE_TRANSPARENCY_FILTER} ` : ''}invert(1) hue-rotate(180deg);`
+          : ''
+      }
+      mix-blend-mode: screen;
+    }
+    p[width][height] > img.monochrome-diagram:only-child {
+      mix-blend-mode: screen;
+    }`
+        : ''
     }
     table:has(> colgroup) {
       table-layout: fixed;
@@ -540,6 +606,20 @@ const getPageLayoutStyles = (
      Size it to the paginator's content box, which is right in any writing mode. */
   body.paginated-mode > .main.vrtl.height-100per {
     height: calc(var(--available-height) * 1px) !important;
+  }
+  /* EBPAJ cover pages put a single img.fit inside body.p-cover > .main > p
+     with no block-axis centering, so a width-constrained cover on a portrait
+     screen sticks to the top edge (and under the notch when the header is off).
+     No :only-child on the img: the next-section skip link (a11y.ts) is
+     appended inside that <p>. */
+  body.paginated-mode:is(.p-cover, [epub|type~="cover"]) > .main:has(> p:only-child > img.fit) {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    min-height: calc(var(--available-height) * 1px);
+  }
+  body.paginated-mode:is(.p-cover, [epub|type~="cover"]) > .main:has(> p:only-child > img.fit) > p {
+    margin-block: 0 !important;
   }
   body {
     overflow: unset;
@@ -666,6 +746,34 @@ const getPageLayoutStyles = (
     max-height: calc(var(--available-height) * 1px);
   }
 
+  /* A section holding only an image (a cover, a plate) has it sized to the
+     page. A top margin above it makes its line taller than the page, and the
+     rest goes onto the next page: WebKit cuts the image there, Chromium moves
+     it whole and leaves a blank page (#6676). */
+  body.paginated-mode :has(.lone-image) {
+    margin-block-start: 0 !important;
+  }
+  /* WebKit never moves anything taller than a page: it cuts it where it falls.
+     An image sized to the page sits on the baseline with the line's descent
+     under it, so its line is a few px taller than the page and the image is
+     cut across two pages. Chromium moves it whole. Aligning an image alone on
+     its line to the top drops the descent, so its line fits; an image that
+     shares its line with text keeps the book's alignment.
+     A block that ends exactly on a page boundary also carries the margin after
+     it onto the next page, where Chromium drops it, so a second page-tall image
+     went a page further and left a blank page. Ending the line 1px early lets
+     WebKit drop that margin; :where() lets a book's own margin win.
+     -webkit-line-box-contain is supported only by WebKit (#6676). */
+  @supports (-webkit-line-box-contain: replaced) {
+    body.paginated-mode img.alone-on-line:not(.has-text-siblings),
+    body.paginated-mode .lone-image {
+      vertical-align: top;
+    }
+    :where(body.paginated-mode img.alone-on-line:not(.has-text-siblings)) {
+      margin-block-end: -1px;
+    }
+  }
+
   body.scroll-mode img {
     max-width: 100%;
     object-fit: contain;
@@ -689,6 +797,9 @@ const getPageLayoutStyles = (
     height: 1em;
   }
   img.has-text-siblings {
+    ${vertical ? 'width: 1em;' : 'height: 1em;'}
+  }
+  img[class*="gaiji"] {
     ${vertical ? 'width: 1em;' : 'height: 1em;'}
   }
   /* Baseline is only Readest's default: applyImageStyle adds this class when the
@@ -1346,7 +1457,7 @@ const wrapPublisherFonts = (families: string, rewriteGenerics = false) => {
 };
 
 const FONT_SIZE =
-  /^(?:(?:\d+(?:\.\d+)?|\.\d+)(?:[a-z]+|%)|x*-?(?:small|large)|medium|smaller|larger)$/i;
+  /^(?:(?:\d+(?:\.\d+)?|\.\d+)(?:[a-z]+|%)|x*-?(?:small|large)|medium|smaller|larger|calc\([^\s/]*\))$/i;
 
 // In a `font` shorthand the family list comes last, after the size and an
 // optional `/line-height`, e.g. `font: italic 1em/1.2 Palatino, serif`.
@@ -1595,23 +1706,17 @@ export const transformStylesheet = (
     return match;
   });
 
-  // `@media (orientation: ...)` inside a section is evaluated against the
+  // Width and height media features inside a section are evaluated against the
   // iframe, and the paginator sizes that iframe to the whole multi-column strip
-  // rather than to a page: a one-page section reports portrait and a two-page
-  // section landscape. The strip width is itself derived from the content, so a
-  // rule that changes the content's height — `column-count: 2` in the IDPF
-  // media-query sample — flips the query, which flips the page count, which
-  // flips the query straight back, and the layout never settles (#6038).
-  // Resolve the feature against the reader's own viewport, the same thing the
-  // vw/vh rewrite below does and for the same reason, so the book gets the
-  // orientation the reader is actually in and the cycle cannot form.
-  // Width and height features are the same trap: a two-page section makes the
-  // strip twice as wide, so the sample's `(max-width: 480px)` block flips on the
-  // page count it is itself deciding. Both rewrites are confined to the prelude,
-  // between `@media` and the `{` that opens its block, so the same literal in a
-  // declaration value or an attribute selector is left as the book wrote it. The
-  // two sentinels below resolve to themselves, so the passes are order-free.
-  const isLandscape = vw > vh;
+  // rather than to a page. A two-page section makes the strip twice as wide, so
+  // the IDPF sample's `(max-width: 480px)` block flips on the page count it is
+  // itself deciding (#6038). Resolve them against the reader's own viewport,
+  // the same thing the vw/vh rewrite below does and for the same reason.
+  // `(orientation: ...)` is the same trap, but the reading area can turn while
+  // the book is open, so it is left for applyOrientationMedia to resolve on the
+  // parsed sheets. The rewrite is confined to the prelude, between `@media` and
+  // the `{` that opens its block, so the same literal in a declaration value or
+  // an attribute selector is left as the book wrote it.
   const always = '(min-width: 0px)';
   const never = '(min-width: 999999px)';
   // Park quoted values first, the same way the url() pass above does, so an
@@ -1622,25 +1727,47 @@ export const transformStylesheet = (
     return `READEST_STR_${quoted.length - 1}_PLACEHOLDER`;
   });
   css = css.replace(/@media[^{]*/gi, (prelude) =>
-    prelude
-      .replace(/\(\s*orientation\s*:\s*(landscape|portrait)\s*\)/gi, (_, mode: string) =>
-        (mode.toLowerCase() === 'landscape') === isLandscape ? always : never,
-      )
-      .replace(
-        /\(\s*(min|max)-(width|height)\s*:\s*([^)]+?)\s*\)/gi,
-        (feature, bound: string, axis: string, length: string) => {
-          // Only lengths that are already px can be resolved without guessing at
-          // the book's root font size; anything else keeps the authored feature.
-          const px = /^(\d*\.?\d+)(?:px)?$/.exec(length);
-          if (!px) return feature;
-          const viewport = axis.toLowerCase() === 'width' ? vw : vh;
-          const bounds = parseFloat(px[1]!);
-          return (bound.toLowerCase() === 'min' ? viewport >= bounds : viewport <= bounds)
-            ? always
-            : never;
-        },
-      ),
+    prelude.replace(
+      /\(\s*(min|max)-(width|height)\s*:\s*([^)]+?)\s*\)/gi,
+      (feature, bound: string, axis: string, length: string) => {
+        // Only lengths that are already px can be resolved without guessing at
+        // the book's root font size; anything else keeps the authored feature.
+        const px = /^(\d*\.?\d+)(?:px)?$/.exec(length);
+        if (!px) return feature;
+        const viewport = axis.toLowerCase() === 'width' ? vw : vh;
+        const bounds = parseFloat(px[1]!);
+        return (bound.toLowerCase() === 'min' ? viewport >= bounds : viewport <= bounds)
+          ? always
+          : never;
+      },
+    ),
   );
+  // A section iframe spans its own columns, so its native vw/vh can depend
+  // on the number of pages. Resolve declaration values against the reader.
+  // Whole tokens are matched, so a name like `.a-10vw` is left alone (the web
+  // build rejects lookbehind, which older iOS WebViews cannot parse). The calc
+  // has no spaces so a `font` shorthand still reads it as one size token.
+  const viewportLength = /^([+-]?(?:\d*\.)?\d+(?:e[+-]?\d+)?)(vw|vh)$/i;
+  const tokens = /url\([^)]*\)|\/\*[\s\S]*?\*\/|[\w.+-]+/gi;
+  const resolveLength = (token: string, inCondition: boolean) => {
+    const length = viewportLength.exec(token);
+    if (!length) return token;
+    const axis = length[2]!.toLowerCase();
+    const unit = (axis === 'vw' ? vw : vh) / 100;
+    return inCondition
+      ? `${Number(length[1]) * unit}px`
+      : `calc(${length[1]}*var(--readest-${axis},${unit}px))`;
+  };
+  if (/\d(?:vw|vh)/i.test(css)) {
+    css = css.replace(
+      new RegExp(`@(?:media|supports|container|import)\\b[^{;]*|${tokens.source}`, 'gi'),
+      (token) =>
+        // At-rule conditions cannot read CSS custom properties.
+        token.startsWith('@')
+          ? token.replace(tokens, (word) => resolveLength(word, true))
+          : resolveLength(token, false),
+    );
+  }
   css = css.replace(/READEST_STR_(\d+)_PLACEHOLDER/g, (_, i) => quoted[+i]!);
 
   // replace absolute font sizes with rem units
@@ -1668,8 +1795,6 @@ export const transformStylesheet = (
     })
     // remove no-op backdrop-filter: brightness(100%); see #3895
     .replace(/backdrop-filter\s*:\s*brightness\(100%\)\s*[;]?/gi, '')
-    .replace(/(\d*\.?\d+)vw/gi, (_, d) => (parseFloat(d) * vw) / 100 + 'px')
-    .replace(/(\d*\.?\d+)vh/gi, (_, d) => (parseFloat(d) * vh) / 100 + 'px')
     .replace(/([\s;])-webkit-user-select\s*:\s*none/gi, '$1-webkit-user-select: unset')
     .replace(/([\s;])-moz-user-select\s*:\s*none/gi, '$1-moz-user-select: unset')
     .replace(/([\s;])-ms-user-select\s*:\s*none/gi, '$1-ms-user-select: unset')
@@ -1799,6 +1924,53 @@ export const applyEinkModeAttribute = (document: Document, isEink: boolean) => {
   document.documentElement.setAttribute('data-eink', isEink ? 'true' : 'false');
 };
 
+// The reading area's size, for the vw/vh lengths transformStylesheet rewrites.
+export const applyViewportUnits = (document: Document, width: number, height: number) => {
+  // A section document can briefly have no root while the reader remounts.
+  const root = document.documentElement as HTMLElement | null;
+  if (!root || width <= 0 || height <= 0) return;
+  root.style.setProperty('--readest-vw', `${width / 100}px`);
+  root.style.setProperty('--readest-vh', `${height / 100}px`);
+};
+
+type MediaNode = { media?: MediaList; styleSheet?: CSSStyleSheet | null; cssRules?: CSSRuleList };
+const authoredMedia = new WeakMap<MediaList, string>();
+
+/**
+ * Resolve the book's `@media (orientation: ...)` against the reading area.
+ *
+ * Inside a section the feature would describe the iframe, which the paginator
+ * sizes to the column strip or the chapter height, so the query and the
+ * content feed each other (#6038). Each feature in the parsed sheets is set to
+ * an always/never condition instead, and re-resolved from the authored text
+ * when the reading area turns. Only the media condition changes: selectors,
+ * specificity and the rest of the query stay as the book wrote them.
+ */
+export const applyOrientationMedia = (document: Document, isLandscape: boolean) => {
+  const visit = ({ media, styleSheet, cssRules }: MediaNode) => {
+    const authored = media ? (authoredMedia.get(media) ?? media.mediaText) : '';
+    if (media && /\(\s*orientation\s*:/i.test(authored)) {
+      authoredMedia.set(media, authored);
+      media.mediaText = authored.replace(
+        /\(\s*orientation\s*:\s*(landscape|portrait)\s*\)/gi,
+        (_, mode: string) =>
+          (mode.toLowerCase() === 'landscape') === isLandscape
+            ? '(min-width: 0px)'
+            : '(min-width: 999999px)',
+      );
+    }
+    if (styleSheet) visit(styleSheet);
+    for (const rule of Array.from(cssRules ?? [])) visit(rule as MediaNode);
+  };
+  for (const sheet of Array.from(document.styleSheets)) {
+    try {
+      visit(sheet);
+    } catch {
+      // A cross-origin sheet's rules can't be read; it keeps its own queries.
+    }
+  }
+};
+
 /**
   @param document should be the global `document`
 */
@@ -1820,7 +1992,102 @@ export const applyScrollbarStyle = (document: Document, hideScrollbar: boolean) 
   }
 };
 
-export const applyImageStyle = (document: Document) => {
+const INLINE_IMAGE_CONTAINER_TAGS = new Set([
+  'span',
+  'rb',
+  'ruby',
+  'rt',
+  'rp',
+  'em',
+  'strong',
+  'b',
+  'i',
+  'u',
+  's',
+  'small',
+  'sub',
+  'sup',
+  'mark',
+  'cite',
+  'q',
+]);
+
+// An element whose content flows on its parent's lines (a, span, a div made
+// inline); anything else but an inline-block ends the line. An empty value
+// is the initial `inline`, in environments that report unset props as ''.
+const flowsInLine = (display: string) =>
+  display === 'inline' || display === '' || display === 'contents' || display.startsWith('ruby');
+
+// What comes first on the image's line, reading `node` in one direction:
+// text, a line break (a <br> or a block), or neither
+const scanLine = (node: Node, forward: boolean, win: Window): 'text' | 'break' | null => {
+  if (node.nodeType === Node.TEXT_NODE) return node.textContent?.trim() ? 'text' : null;
+  if (node.nodeType !== Node.ELEMENT_NODE) return null;
+  const el = node as Element;
+  const display = win.getComputedStyle(el).display;
+  if (display === 'none') return null;
+  if (el.localName === 'br') return 'break';
+  if (display.startsWith('inline-')) return el.textContent?.trim() ? 'text' : null;
+  if (!flowsInLine(display)) return 'break';
+  const children = Array.from(el.childNodes);
+  for (const child of forward ? children : children.reverse()) {
+    const found = scanLine(child, forward, win);
+    if (found) return found;
+  }
+  return null;
+};
+
+// Whether text shares the image's line: read out from the image and from each
+// inline element around it (links included), up to a <br> or a block. A break
+// ends the line in that direction for every element further out too.
+const hasTextOnLine = (img: Element, win: Window): boolean => {
+  const open = { backward: true, forward: true };
+  for (let node: Element = img; node.parentElement; node = node.parentElement) {
+    for (const forward of [false, true]) {
+      const side = forward ? 'forward' : 'backward';
+      let sib = open[side] ? (forward ? node.nextSibling : node.previousSibling) : null;
+      for (; sib; sib = forward ? sib.nextSibling : sib.previousSibling) {
+        const found = scanLine(sib, forward, win);
+        if (found === 'text') return true;
+        if (found === 'break') {
+          open[side] = false;
+          break;
+        }
+      }
+    }
+    if (!flowsInLine(win.getComputedStyle(node.parentElement).display)) return false;
+  }
+  return false;
+};
+
+const hasInlineTextSibling = (container: Element, targetNode: Node): boolean => {
+  const childNodes = Array.from(container.childNodes);
+  const idx = childNodes.indexOf(targetNode as ChildNode);
+  if (idx === -1) return false;
+
+  for (const step of [-1, 1]) {
+    for (let i = idx + step; i >= 0 && i < childNodes.length; i += step) {
+      const node = childNodes[i]!;
+      if (node.nodeType === Node.TEXT_NODE && node.textContent?.trim()) {
+        return true;
+      }
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const el = node as Element;
+        const tag = el.tagName.toLowerCase();
+        if (tag === 'br' || el.querySelector('br')) {
+          break;
+        }
+        if (INLINE_IMAGE_CONTAINER_TAGS.has(tag) && el.textContent?.trim()) {
+          return true;
+        }
+      }
+    }
+  }
+
+  return false;
+};
+
+export const applyImageStyle = (document: Document, isDarkMode = false, isFixedLayout = false) => {
   const win = document.defaultView ?? window;
   // Two-phase (read then write): reading getComputedStyle after a class/style
   // write forces a style recalc, so gather every decision first and apply the
@@ -1848,22 +2115,39 @@ export const applyImageStyle = (document: Document) => {
 
     let inlineWithText = false;
     let keepBaseline = false;
+    const isGaiji = !!(img.className && /(?:^|\s)gaiji(?:-|\s|$)/i.test(img.className));
     const parent = img.parentNode;
     if (parent && parent.nodeType === Node.ELEMENT_NODE) {
-      const childNodes = Array.from(parent.childNodes);
-      const hasTextSiblings = childNodes.some(
-        (node) => node.nodeType === Node.TEXT_NODE && node.textContent?.trim(),
-      );
-      const isInline = childNodes.every(
-        (node) => node.nodeType !== Node.ELEMENT_NODE || (node as Element).tagName !== 'BR',
-      );
+      let hasTextSiblings = false;
+      let targetNode: Node = img;
+      let container: Element | null = parent as Element;
+
+      while (container) {
+        if (hasInlineTextSibling(container, targetNode)) {
+          hasTextSiblings = true;
+          break;
+        }
+        const hasBrInWrapper = Array.from(container.childNodes).some(
+          (node) =>
+            node.nodeType === Node.ELEMENT_NODE && (node as Element).tagName.toUpperCase() === 'BR',
+        );
+        if (hasBrInWrapper) break;
+
+        const parentElem: Element | null = container.parentElement;
+        if (parentElem && INLINE_IMAGE_CONTAINER_TAGS.has(container.tagName.toLowerCase())) {
+          targetNode = container;
+          container = parentElem;
+        } else {
+          break;
+        }
+      }
       // A glyph image standing in for a character is never sized as a share
       // of the line; a title image the book sizes that way keeps it (#7039).
       // computedStyleMap keeps the percentage that getComputedStyle resolves,
       // also inside a calc() (serialized as e.g. `calc(30% - 1px)`).
       const width = img.computedStyleMap?.().get('width');
       const percentSized = !!width && width.toString().includes('%');
-      inlineWithText = hasTextSiblings && isInline && !percentSized;
+      inlineWithText = (hasTextSiblings || isGaiji) && !percentSized;
       if (inlineWithText) {
         // Only supply Readest's baseline default when the book leaves
         // vertical-align at its initial value; an author-set value (e.g. a CJK
@@ -1881,6 +2165,7 @@ export const applyImageStyle = (document: Document) => {
       keepBaseline,
       noEnlarge,
       leadingImageParagraph,
+      aloneOnLine: !hasTextOnLine(img, win),
     };
   });
 
@@ -1909,8 +2194,10 @@ export const applyImageStyle = (document: Document) => {
     keepBaseline,
     noEnlarge,
     leadingImageParagraph,
+    aloneOnLine,
   } of plans) {
     leadingImageParagraph?.classList.add('leading-image');
+    if (aloneOnLine) img.classList.add('alone-on-line');
     if (!isNaN(percentWidth)) {
       img.style.width = `${(percentWidth / 100) * baseWidth}px`;
       img.removeAttribute('width');
@@ -1936,6 +2223,20 @@ export const applyImageStyle = (document: Document) => {
       hr.classList.add('background-img');
     }
   });
+  classifyAndTagStandaloneDiagrams(document, isDarkMode, isFixedLayout);
+  // A section holding only one image, with no text, is a picture page.
+  // An svg's title and desc are never drawn.
+  const images = document.body?.querySelectorAll('img, svg');
+  if (images?.length === 1) {
+    const texts = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let hasText = false;
+    for (let node = texts.nextNode(); node && !hasText; node = texts.nextNode()) {
+      hasText =
+        !!node.textContent?.trim() &&
+        !node.parentElement?.closest('title, desc, metadata, style, script');
+    }
+    if (!hasText) images[0]!.classList.add('lone-image');
+  }
 };
 
 // The enlarged link hit area positions every link and its ::before box, and

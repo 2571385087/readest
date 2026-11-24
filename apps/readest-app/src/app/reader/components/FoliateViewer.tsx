@@ -33,6 +33,7 @@ import {
   CHUNKED_SECTION_THRESHOLD,
   clearChapterScreens,
   getMeasuredChapterScreens,
+  growChapterScreens,
   harvestLoadedChapterScreens,
   recordChapterScreens,
   snapshotChapterScreens,
@@ -47,6 +48,8 @@ import { useKOSync } from '../hooks/useKOSync';
 import { useFileSync } from '../hooks/useFileSync';
 import {
   applyEinkModeAttribute,
+  applyOrientationMedia,
+  applyViewportUnits,
   applyFixedlayoutStyles,
   applyImageStyle,
   applyNamespacedAttributes,
@@ -63,7 +66,10 @@ import {
   transformStylesheet,
 } from '@/utils/style';
 import { applyScrollableStyle, applyTableTouchScroll } from '@/utils/scrollable';
+import { bindInlineEventHandlers } from '@/utils/inlineEventHandlers';
+import { classifyAndTagStandaloneDiagrams } from '@/utils/imageClassifier';
 import { mountAdditionalFonts, mountCustomFont } from '@/styles/fonts';
+import { mountWhiteTransparencyFilter } from '@/utils/imageBackground';
 import { layoutWarichu, relayoutWarichu } from '@/utils/warichu';
 import { refreshSectionGlosses, whenSelectionClears } from '@/app/reader/utils/wordlensSection';
 import { useVocabularyStore } from '@/store/vocabularyStore';
@@ -142,6 +148,13 @@ declare global {
   }
 }
 
+// The reading area is the foliate-view box: the sidebars overlay it, and the
+// section iframes inside it are sized to their content.
+const isLandscapeBox = (el: Element) => {
+  const { width, height } = el.getBoundingClientRect();
+  return width > height;
+};
+
 // The hooks that follow the reading position (progress sync and save, KOSync, file sync, the
 // translation of the shown page) subscribe to the progress, which every page turn writes. Here they
 // re-render on a turn without the viewer and everything it holds.
@@ -200,6 +213,7 @@ const FoliateViewer: React.FC<{
   const getViewSettings = useReaderStore((s) => s.getViewSettings);
   const setViewSettings = useReaderStore((s) => s.setViewSettings);
   const getParallels = useParallelViewStore((s) => s.getParallels);
+  const getSectionOffset = useParallelViewStore((s) => s.getSectionOffset);
   const getBookData = useBookDataStore((s) => s.getBookData);
   const getConfig = useBookDataStore((s) => s.getConfig);
   const setConfig = useBookDataStore((s) => s.setConfig);
@@ -227,7 +241,9 @@ const FoliateViewer: React.FC<{
   const [scrollMargins, setScrollMargins] = useState({ top: 0, bottom: 0 });
   const docLoaded = useRef(false);
 
-  const autoScroll = useAutoScroll(bookKey, viewRef);
+  // Commits the relocation an Auto Scroll wipe held back (see commitRelocate).
+  const wipeCommitRef = useRef<(() => void) | null>(null);
+  const autoScroll = useAutoScroll(bookKey, viewRef, wipeCommitRef);
   const { registerSpeedListeners, overlayVisible: speedOverlayVisible } =
     useAutoScrollSpeedGesture(autoScroll);
 
@@ -284,6 +300,8 @@ const FoliateViewer: React.FC<{
   // by the browser's normal vsync loop, and doesn't accumulate when
   // the page is busy — which is the behaviour we want here.
   const pendingRelocateRef = useRef<CustomEvent | null>(null);
+  // A linked book's move an Auto Scroll wipe held back (see docRelocateHandler).
+  const heldParallelRelocateRef = useRef<{ index: number; fraction: number } | null>(null);
   const relocateRafRef = useRef<number | null>(null);
   const relocateTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSampledSpineRef = useRef<number | null>(null);
@@ -298,8 +316,77 @@ const FoliateViewer: React.FC<{
     relocateRafRef.current = null;
     cancelAnimationFrame(id);
   }, []);
+  const sampleChapterScreens = useCallback(
+    (sampledSpine: number | undefined) => {
+      // Sample the section's measured spread count as it becomes primary: the
+      // session map calibrates the book-level page pair (chapterScreens.ts).
+      // Chunked sections report chunk-local counts, so they stay byte-estimated.
+      // getBookData is re-read here, not captured: this callback is memoized
+      // without bookData, and the book document loads after the first render.
+      const spineChanged = sampledSpine != null && sampledSpine !== lastSampledSpineRef.current;
+      if (spineChanged) {
+        lastSampledSpineRef.current = sampledSpine;
+        const sectionSize = getBookData(bookKey)?.bookDoc?.sections?.[sampledSpine]?.size;
+        if (
+          (sectionSize ?? 0) <= CHUNKED_SECTION_THRESHOLD &&
+          !getMeasuredChapterScreens(bookKey)?.has(sampledSpine)
+        ) {
+          const measuredPages = viewRef.current?.renderer?.pages;
+          if (measuredPages && measuredPages > 0) {
+            recordChapterScreens(bookKey, sampledSpine, measuredPages);
+          }
+        }
+      }
+      // Harvest every loaded section's measured count (primary, preloaded
+      // neighbors, rendered chunks): with readest/foliate-js#133 the whole
+      // preloaded window is exact, not just the current chapter. No-op on
+      // foliate builds without the exposed contentPages. contentPages counts
+      // columns; the paginator exposes its real column count as a public
+      // property, so convert per section to spreads with ceil for the partial
+      // final screen. Deriving the ratio from renderer.pages instead would be
+      // wrong — that getter rounds, so e.g. 3 columns / 2 per screen reads 1.5.
+      const loadedContents = viewRef.current?.renderer?.getContents?.();
+      const columnCount = viewRef.current?.renderer?.columnCount ?? 0;
+      if (loadedContents?.length && columnCount > 0) {
+        // Chunked sections stay out of the harvest: getContents() lists one
+        // entry per rendered chunk, so a spine sum is only a partial count that
+        // grows as later chunks render - freezing it as the chapter's measured
+        // weight would understate it. They keep the byte estimate (the primary
+        // item above still contributes its column ratio even when chunked).
+        const sectionSizes = getBookData(bookKey)?.bookDoc?.sections;
+        harvestLoadedChapterScreens(
+          bookKey,
+          loadedContents
+            .filter(
+              (c) =>
+                (c.index == null ? 0 : (sectionSizes?.[c.index]?.size ?? 0)) <=
+                CHUNKED_SECTION_THRESHOLD,
+            )
+            .map((c) => ({
+              index: c.index,
+              contentPages: Math.ceil((c.contentPages ?? 0) / columnCount),
+            })),
+        );
+      }
+      if (spineChanged) {
+        // Freeze the readout weights at chapter entry: the snapshot adopts this
+        // chapter's fresh measurement plus everything harvested since the last
+        // entry, so estimate corrections land at chapter boundaries - never
+        // mid-chapter, where they would break the one-page-per-turn cadence.
+        snapshotChapterScreens(bookKey);
+      }
+      const page = viewRef.current?.renderer?.page;
+      if (sampledSpine != null && page != null) growChapterScreens(bookKey, sampledSpine, page);
+    },
+    [bookKey],
+  );
+  const { isWipeAhead } = autoScroll;
   const commitRelocate = useCallback(() => {
     cancelRelocateScheduled();
+    // An Auto Scroll wipe turns to the next page while the reader is still on
+    // the page above it (#7575). That page is held back, also on close, until
+    // the wipe brings it in, or is replaced when the wipe turns back.
+    if (isWipeAhead()) return;
     const event = pendingRelocateRef.current;
     pendingRelocateRef.current = null;
     if (!event) return;
@@ -327,65 +414,8 @@ const FoliateViewer: React.FC<{
     // Stable page numbers (the default) keep the byte-grid pair and need no
     // measurements; only the screen-counted readout samples chapters.
     if (getViewSettings(bookKey)?.stablePageNumbers !== false) return;
-    // Sample the section's measured spread count as it becomes primary: the
-    // session map calibrates the book-level page pair (chapterScreens.ts).
-    // Chunked sections report chunk-local counts, so they stay byte-estimated.
-    // getBookData is re-read here, not captured: this callback is memoized
-    // without bookData, and the book document loads after the first render.
-    const sampledSpine = detail.section?.current;
-    const spineChanged = sampledSpine != null && sampledSpine !== lastSampledSpineRef.current;
-    if (spineChanged) {
-      lastSampledSpineRef.current = sampledSpine;
-      const sectionSize = getBookData(bookKey)?.bookDoc?.sections?.[sampledSpine]?.size;
-      if (
-        (sectionSize ?? 0) <= CHUNKED_SECTION_THRESHOLD &&
-        !getMeasuredChapterScreens(bookKey)?.has(sampledSpine)
-      ) {
-        const measuredPages = viewRef.current?.renderer?.pages;
-        if (measuredPages && measuredPages > 0) {
-          recordChapterScreens(bookKey, sampledSpine, measuredPages);
-        }
-      }
-    }
-    // Harvest every loaded section's measured count (primary, preloaded
-    // neighbors, rendered chunks): with readest/foliate-js#133 the whole
-    // preloaded window is exact, not just the current chapter. No-op on
-    // foliate builds without the exposed contentPages. contentPages counts
-    // columns; the paginator exposes its real column count as a public
-    // property, so convert per section to spreads with ceil for the partial
-    // final screen. Deriving the ratio from renderer.pages instead would be
-    // wrong — that getter rounds, so e.g. 3 columns / 2 per screen reads 1.5.
-    const loadedContents = viewRef.current?.renderer?.getContents?.();
-    const columnCount = viewRef.current?.renderer?.columnCount ?? 0;
-    if (loadedContents?.length && columnCount > 0) {
-      // Chunked sections stay out of the harvest: getContents() lists one
-      // entry per rendered chunk, so a spine sum is only a partial count that
-      // grows as later chunks render - freezing it as the chapter's measured
-      // weight would understate it. They keep the byte estimate (the primary
-      // item above still contributes its column ratio even when chunked).
-      const sectionSizes = getBookData(bookKey)?.bookDoc?.sections;
-      harvestLoadedChapterScreens(
-        bookKey,
-        loadedContents
-          .filter(
-            (c) =>
-              (c.index == null ? 0 : (sectionSizes?.[c.index]?.size ?? 0)) <=
-              CHUNKED_SECTION_THRESHOLD,
-          )
-          .map((c) => ({
-            index: c.index,
-            contentPages: Math.ceil((c.contentPages ?? 0) / columnCount),
-          })),
-      );
-    }
-    if (spineChanged) {
-      // Freeze the readout weights at chapter entry: the snapshot adopts this
-      // chapter's fresh measurement plus everything harvested since the last
-      // entry, so estimate corrections land at chapter boundaries - never
-      // mid-chapter, where they would break the one-page-per-turn cadence.
-      snapshotChapterScreens(bookKey);
-    }
-  }, [bookKey, setProgress, cancelRelocateScheduled]);
+    sampleChapterScreens(detail.section?.current);
+  }, [bookKey, setProgress, cancelRelocateScheduled, isWipeAhead, sampleChapterScreens]);
 
   const progressRelocateHandler = (event: Event) => {
     // Foliate can emit a late relocation after close() clears its progress
@@ -427,6 +457,9 @@ const FoliateViewer: React.FC<{
       }
       cancelRelocateScheduled();
       pendingRelocateRef.current = null;
+      // A wipe ending after close must not move linked books to the page it
+      // held back, which was never reached.
+      heldParallelRelocateRef.current = null;
       // The sampled screen counts describe one open's layout; a reopen starts
       // a fresh map so settings or viewport changes can never leak stale
       // weights across sessions.
@@ -457,9 +490,25 @@ const FoliateViewer: React.FC<{
   const settingsFingerprint = viewSettings
     ? JSON.stringify(viewSettings) + '|' + JSON.stringify(getLoadedFonts())
     : '';
+  const stablePageNumbers = viewSettings?.stablePageNumbers;
   useEffect(() => {
     invalidateChapterScreens();
-  }, [bookKey, invalidateChapterScreens, settingsFingerprint]);
+    // With Stable Page Numbers off the readouts and jumps read these counts.
+    // A setting that lays nothing out again (turning this one off, too) has
+    // no relocate to measure them, so measure what is loaded now, or the
+    // readouts keep the old numbers until the next page turn (#7445). The
+    // entry marker stays dropped: a setting that does lay the book out again
+    // relocates in this chapter afterwards and re-takes the snapshot.
+    if (stablePageNumbers !== false) return;
+    sampleChapterScreens(viewRef.current?.renderer?.primaryIndex);
+    lastSampledSpineRef.current = null;
+  }, [
+    bookKey,
+    invalidateChapterScreens,
+    settingsFingerprint,
+    stablePageNumbers,
+    sampleChapterScreens,
+  ]);
 
   // Same for container resizes (window, sidebar, orientation): the paginator
   // re-renders on resize, invalidating every measured count. The view element
@@ -473,7 +522,20 @@ const FoliateViewer: React.FC<{
       if (typeof ResizeObserver === 'undefined') return;
       const el = viewRef.current;
       if (el) {
-        observer = new ResizeObserver(() => invalidateChapterScreens());
+        // The same resize can turn the reading area, which the book's
+        // `(orientation: ...)` rules follow (see applyOrientationMedia), and
+        // changes what the book's vw/vh lengths resolve to.
+        let landscape = isLandscapeBox(el);
+        observer = new ResizeObserver(([entry]) => {
+          invalidateChapterScreens();
+          if (entry && !getBookData(bookKey)?.isFixedLayout) {
+            const { width, height } = entry.contentRect;
+            for (const { doc } of el.renderer.getContents()) applyViewportUnits(doc, width, height);
+          }
+          if (isLandscapeBox(el) === landscape) return;
+          landscape = !landscape;
+          for (const { doc } of el.renderer.getContents()) applyOrientationMedia(doc, landscape);
+        });
         observer.observe(el);
         return;
       }
@@ -584,13 +646,28 @@ const FoliateViewer: React.FC<{
       // UI language is the last resort, for a book that says nothing at all.
       const documentRtl = writingDir?.rtl || getDirFromUILanguage() === 'rtl' || false;
       const newRtl = getPageProgressionRTL(viewSettings.writingMode, bookDoc.dir, documentRtl);
-      if (viewSettings.vertical !== newVertical || viewSettings.rtl !== newRtl) {
+      // Continuous scrolling keeps the neighbouring sections mounted, and they
+      // finish loading *after* the one being read. A horizontal front matter
+      // landing last therefore used to rewrite a vertical book's writing mode
+      // to horizontal, and persist it: page turns, the scrollbar, the reading
+      // ruler and every overlay then disagreed with the text on screen (the
+      // footnote popup sized its box along the wrong axis for exactly this
+      // reason). Only the section the reader is actually on speaks for the
+      // book; a neighbour keeps its own direction locally, which is all the
+      // scrollbar position below needs from it.
+      const primaryDoc = renderer
+        ?.getContents?.()
+        .find((content) => content.index === renderer?.primaryIndex)?.doc;
+      const speaksForBook = !primaryDoc || primaryDoc === detail.doc;
+      if (speaksForBook && (viewSettings.vertical !== newVertical || viewSettings.rtl !== newRtl)) {
         viewSettings.vertical = newVertical;
         viewSettings.rtl = newRtl;
         setViewSettings(bookKey, { ...viewSettings });
       }
 
       if (!bookData?.isFixedLayout) {
+        const view = viewRef.current;
+        if (view) applyViewportUnits(detail.doc, view.clientWidth, view.clientHeight);
         mountAdditionalFonts(detail.doc, isCJKLang(bookData.book?.primaryLanguage));
       }
 
@@ -606,7 +683,8 @@ const FoliateViewer: React.FC<{
         }
       }
 
-      applyImageStyle(detail.doc);
+      mountWhiteTransparencyFilter(detail.doc);
+      applyImageStyle(detail.doc, useThemeStore.getState().isDarkMode, bookData?.isFixedLayout);
       applyScrollableStyle(detail.doc);
       applyTableTouchScroll(detail.doc);
       // Read the theme live: `useFoliateEvents` binds this handler once, so the
@@ -614,6 +692,7 @@ const FoliateViewer: React.FC<{
       applyThemeModeClass(detail.doc, useThemeStore.getState().isDarkMode);
       applyScrollModeClass(detail.doc, viewSettings.scrolled || false);
       applyEinkModeAttribute(detail.doc, viewSettings.isEink || false);
+      if (viewRef.current) applyOrientationMedia(detail.doc, isLandscapeBox(viewRef.current));
       applyScrollbarStyle(document, viewSettings.hideScrollbar || false);
       keepTextAlignment(detail.doc);
       handleA11yNavigation(viewRef.current, detail.doc, {
@@ -630,7 +709,7 @@ const FoliateViewer: React.FC<{
         if (section?.loadHref) observeDynamicResources(detail.doc, section.loadHref);
       }
 
-      // Inline scripts in tauri platforms are not executed by default
+      // Inline scripts and event handlers in tauri platforms are not executed by default
       if (viewSettings.allowScript && isTauriAppPlatform()) {
         evalInlineScripts(detail.doc);
       }
@@ -719,6 +798,7 @@ const FoliateViewer: React.FC<{
           console.error(`Error executing iframe script ${index + 1}:`, error);
         }
       });
+      bindInlineEventHandlers(doc);
     }
   };
 
@@ -756,6 +836,7 @@ const FoliateViewer: React.FC<{
       appLang: getLocale(),
       allowDownload,
       vocabulary: useVocabularyStore.getState().getLearningAndMastered(vocabularyLang(bookLang)),
+      onGlossesChanged: () => eventDispatcher.dispatch('wordlens-glosses-changed', { bookKey }),
       onProgress: () => {
         if (wordLensToastShownRef.current) return;
         wordLensToastShownRef.current = true;
@@ -816,17 +897,37 @@ const FoliateViewer: React.FC<{
     // can flow normally.
     setPreviewMode(bookKey, false);
 
+    // Linked books follow an Auto Scroll wipe's turn once the page is wiped
+    // in, like the reading position (#7575).
+    if (isWipeAhead()) {
+      heldParallelRelocateRef.current = detail;
+      return;
+    }
+    heldParallelRelocateRef.current = null;
+    syncParallelViews(detail);
+  };
+
+  const syncParallelViews = (detail: { index: number; fraction: number }) => {
     const parallelViews = getParallels(bookKey);
     if (parallelViews && parallelViews.size > 0) {
       parallelViews.forEach((key) => {
         if (key !== bookKey) {
           const target = getView(key)?.renderer;
           if (target) {
-            target.goTo?.({ index: detail.index, anchor: detail.fraction });
+            const index = detail.index + getSectionOffset(bookKey, key);
+            target.goTo?.({ index, anchor: detail.fraction });
           }
         }
       });
     }
+  };
+
+  // The page an Auto Scroll wipe brought in is the reading position now.
+  wipeCommitRef.current = () => {
+    commitRelocate();
+    const held = heldParallelRelocateRef.current;
+    heldParallelRelocateRef.current = null;
+    if (held) syncParallelViews(held);
   };
 
   const { handlePageFlip } = usePagination(bookKey, viewRef, containerRef);
@@ -1139,11 +1240,14 @@ const FoliateViewer: React.FC<{
     const showDoubleBorderHeader = showDoubleBorder && viewSettings.showHeader;
     const showDoubleBorderFooter = showDoubleBorder && viewSettings.showFooter;
     const showTopHeader = viewSettings.showHeader && !viewSettings.vertical;
+    const showRightHeader = viewSettings.showHeader && viewSettings.vertical;
     // The bottom band is reserved only while the footer displays something
-    // there (and never in scrolled mode, where the info floats in pills) —
-    // see footerReservesBand. Otherwise the empty reservation shows as a
-    // full-width blank bar that steals space from the book text.
+    // there (and in scrolled mode only with Solid Footer on; otherwise the
+    // info floats in pills) — see footerReservesBand. Otherwise the empty
+    // reservation shows as a full-width blank bar that steals space from the
+    // book text.
     const showBottomFooter = footerReservesBand(viewSettings) && !viewSettings.vertical;
+    const showLeftFooter = footerReservesBand(viewSettings) && viewSettings.vertical;
     const moreTopInset = showTopHeader ? Math.max(0, 16 - insets.top) : 0;
     // Only the persistent 'minimal' card reserves a band; the 'full' one
     // auto-hides with the toolbar and overlaps instead (#5310).
@@ -1153,23 +1257,44 @@ const FoliateViewer: React.FC<{
     const moreBottomInset = showBottomFooter
       ? Math.max(0, Math.max(miniPlayerClearance, 16) - insets.bottom)
       : Math.max(0, miniPlayerClearance);
-    const moreRightInset = showDoubleBorderHeader ? 32 : 0;
-    const moreLeftInset = showDoubleBorderFooter ? 32 : 0;
+    const baseRightInset = isIPhoneDuo ? viewInsets.right : insets.right;
+    const baseLeftInset = isIPhoneDuo ? viewInsets.left : insets.left;
+    const moreRightInset = showDoubleBorderHeader
+      ? 32
+      : showRightHeader
+        ? Math.max(0, 16 - baseRightInset)
+        : 0;
+    const moreLeftInset = showDoubleBorderFooter
+      ? 32
+      : showLeftFooter
+        ? Math.max(0, 16 - baseLeftInset)
+        : 0;
     // The drawing dock stays up for the whole drawing session, so the text
     // makes room for it instead of running underneath.
     const drawingDock = viewState?.drawingEnabled ? getDrawingDockClearance(gridInsets) : null;
-    const topMargin = (showTopHeader ? insets.top : viewInsets.top) + moreTopInset;
+    // Vertical mode cannot scroll lines vertically out from under top/bottom
+    // safe-area insets (Dynamic Island/notch, home indicator/rounded corners).
+    // Preserve gridInsets.top and gridInsets.bottom while dividing out
+    // foliate-js's 1.5x vertical margin multiplier so effective padding is
+    // gridInsets + viewInsets * 1.5, leaving horizontal mode unchanged.
+    const topMargin = viewSettings.vertical
+      ? gridInsets.top / 1.5 + viewInsets.top
+      : (showTopHeader ? insets.top : viewInsets.top) + moreTopInset;
     // On iPhone Duo the horizontal safe-area insets are applied to the viewer
     // container itself (see the render below), not folded into these margins:
     // the paginator treats a horizontal margin as a gutter and puts only half
     // of it (a quarter in two-column mode) on the outer edge, which left text
     // under the side status strip (#6307). Elsewhere they stay in the margins.
-    const rightMargin = (isIPhoneDuo ? viewInsets.right : insets.right) + moreRightInset;
+    const rightMargin = baseRightInset + moreRightInset;
     const bottomMargin = Math.max(
-      (showBottomFooter ? insets.bottom : viewInsets.bottom) + moreBottomInset,
+      (viewSettings.vertical
+        ? gridInsets.bottom / 1.5 + viewInsets.bottom
+        : showBottomFooter
+          ? insets.bottom
+          : viewInsets.bottom) + moreBottomInset,
       drawingDock?.bottom ?? 0,
     );
-    const leftMargin = (isIPhoneDuo ? viewInsets.left : insets.left) + moreLeftInset;
+    const leftMargin = baseLeftInset + moreLeftInset;
     viewRef.current?.renderer.setAttribute('margin-top', `${topMargin}px`);
     viewRef.current?.renderer.setAttribute('margin-right', `${rightMargin}px`);
     viewRef.current?.renderer.setAttribute('margin-bottom', `${bottomMargin}px`);
@@ -1292,6 +1417,7 @@ const FoliateViewer: React.FC<{
           applyFixedlayoutStyles(doc, pageSettings, undefined, bookData?.book?.format);
         }
         applyThemeModeClass(doc, isDarkMode);
+        classifyAndTagStandaloneDiagrams(doc, isDarkMode, bookData?.isFixedLayout);
         applyScrollModeClass(doc, viewSettings.scrolled || false);
         applyEinkModeAttribute(doc, viewSettings.isEink || false);
         applyScrollbarStyle(document, viewSettings.hideScrollbar || false);
@@ -1422,6 +1548,32 @@ const FoliateViewer: React.FC<{
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [viewSettings?.vertical]);
 
+  // The max inline size depends on the window (a near-square window trims it
+  // on touch devices, and vertical writing measures the longer screen axis),
+  // so a resize re-resolves it; otherwise a maximized window keeps the ceiling
+  // the book opened with and leaves a band on each side (#7510). Only a changed
+  // value is written, since each write re-lays out the page, and a drag is
+  // resolved once it settles. Settings are read when it fires, not captured.
+  useEffect(() => {
+    if (bookDoc.rendition?.layout === 'pre-paginated') return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const handleResize = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        const renderer = viewRef.current?.renderer;
+        const viewSettings = getViewSettings(bookKey);
+        if (!renderer || !viewSettings) return;
+        applyRendererLayout(renderer, getCurrentRendererLayout(viewSettings), bookDoc.rendition);
+      }, 150);
+    };
+    window.addEventListener('resize', handleResize);
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bookKey, bookDoc]);
+
   // iPhone Duo: folding, unfolding, turning the device or flipping book mode
   // changes how many pages the display shows. The paginator keeps the
   // reading position across the re-layout. The layout is resolved here from
@@ -1486,6 +1638,7 @@ const FoliateViewer: React.FC<{
     // footerReservesBand inputs: the band must collapse/return live when the
     // user flips these settings.
     viewSettings?.showStickyProgressBar,
+    viewSettings?.solidScrolledFooter,
     viewSettings?.showRemainingTime,
     viewSettings?.showRemainingPages,
     viewSettings?.showProgressInfo,
@@ -1539,6 +1692,28 @@ const FoliateViewer: React.FC<{
         {...touchHandlers}
       />
       {autoscrollAnchor && <AutoscrollIndicator anchor={autoscrollAnchor} />}
+      {autoScroll.active && autoScroll.wipe && (
+        // The edge of a page wipe, moved by useAutoScroll every frame: the next
+        // page is pulled down over the page being read like a blind, and its
+        // edge casts a short shadow onto it, with a lit rim on dark themes.
+        // E-ink gets a plain 1px line (the global rule drops `shadow-`). The
+        // full-cell layer keeps the edge above the page snapshot.
+        <div
+          aria-hidden
+          data-page-wipe-above=''
+          className='pointer-events-none absolute inset-0 z-10 overflow-hidden'
+        >
+          <div
+            ref={autoScroll.wipeLineRef}
+            className={clsx(
+              'absolute left-0 top-0 h-2',
+              'not-eink:bg-linear-to-b theme-dark:from-black/55 from-black/30 to-transparent',
+              'theme-dark:shadow-[inset_0_1px_0_rgb(255_255_255/0.4)]',
+              'eink:border-base-content eink:border-t',
+            )}
+          />
+        </div>
+      )}
       {autoScroll.active && (
         <AutoScrollControl
           bookKey={bookKey}

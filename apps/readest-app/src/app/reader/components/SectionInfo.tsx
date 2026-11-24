@@ -128,7 +128,7 @@ const SectionInfo: React.FC<SectionInfoProps> = ({
             : blended
               ? 'text-white/75 mix-blend-difference font-light'
               : 'text-base-content font-light',
-          isVertical ? 'writing-vertical-rl max-h-[85%]' : 'top-0',
+          isVertical ? 'writing-vertical-rl max-h-[85%] leading-tight' : 'top-0',
           hidden && 'invisible',
         )}
         role='none'
@@ -140,12 +140,12 @@ const SectionInfo: React.FC<SectionInfoProps> = ({
           ...(textColor ? { color: textColor } : {}),
           ...(isVertical
             ? {
-                top: `${(contentInsets.top - gridInsets.top) * 1.5}px`,
-                bottom: `${(contentInsets.bottom - gridInsets.bottom) * 1.5}px`,
+                top: `${gridInsets.top + (contentInsets.top - gridInsets.top) * 1.5}px`,
+                bottom: `${gridInsets.bottom + (contentInsets.bottom - gridInsets.bottom) * 1.5}px`,
                 right: showDoubleBorder
                   ? `calc(${contentInsets.right}px)`
-                  : `calc(${Math.max(0, contentInsets.right - 32)}px)`,
-                width: showDoubleBorder ? '32px' : `${contentInsets.right}px`,
+                  : `calc(${Math.max(0, Math.max(16, contentInsets.right) - 32)}px)`,
+                width: showDoubleBorder ? '32px' : `${Math.max(16, contentInsets.right)}px`,
               }
             : {
                 top: `${band.top}px`,
