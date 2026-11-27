@@ -10,7 +10,12 @@ export default defineConfig({
   ...base,
   test: {
     ...base.test,
-    include: ['src/__tests__/document/paginator-image-page-fits.browser.test.ts'],
+    include: [
+      'src/__tests__/document/paginator-image-page-fits.browser.test.ts',
+      'src/__tests__/app/user/gift-card-layout.browser.test.tsx',
+      // WebKit kept drawing a replaced filter after a theme change (#7981)
+      'src/__tests__/utils/dark-monochrome-filter.browser.test.ts',
+    ],
     browser: { ...base.test?.browser, instances: [{ browser: 'webkit' }] },
   },
 });

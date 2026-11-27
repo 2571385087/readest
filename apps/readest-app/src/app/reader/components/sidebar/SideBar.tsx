@@ -82,9 +82,19 @@ const SideBar = ({}) => {
     (data) => setIsFullHeightInMobile(data.clientY < 44),
   );
 
+  const isEink =
+    (sideBarBookKey ? getViewSettings(sideBarBookKey)?.isEink : undefined) ??
+    settings.globalViewSettings?.isEink;
+
+  useEffect(() => {
+    if (isSideBarVisible) updateAppTheme(isEink ? 'base-100' : 'base-200');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSideBarVisible, isEink]);
+
+  // Only a visibility change resets the color: an e-ink change while hidden
+  // must not repaint over an open notebook.
   useEffect(() => {
     if (isSideBarVisible) {
-      updateAppTheme('base-200');
       overlayRef.current = document.querySelector('.overlay') as HTMLDivElement | null;
     } else {
       updateAppTheme('base-100');
@@ -177,7 +187,7 @@ const SideBar = ({}) => {
 
   const handleSearchResultClick = (cfi: string) => {
     onNavigateEvent();
-    getView(sideBarBookKey)?.goTo(cfi, { focus: true });
+    getView(sideBarBookKey)?.goTo(cfi, { focus: true, step: true });
   };
 
   const bookData = useBookData(sideBarBookKey);

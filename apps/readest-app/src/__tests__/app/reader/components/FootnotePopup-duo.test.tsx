@@ -84,7 +84,8 @@ vi.mock('@/utils/style', () => ({
   getThemeCode: () => ({ bg: '#fff', fg: '#000', primary: '#000', palette: {} }),
 }));
 vi.mock('@/styles/fonts', () => ({ mountAdditionalFonts: vi.fn(), mountCustomFont: vi.fn() }));
-vi.mock('@/utils/sel', () => ({
+vi.mock('@/utils/sel', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/utils/sel')>()),
   getPosition: (_target: unknown, rect: (typeof hoisted.positionRects)[number]) => {
     hoisted.positionRects.push(rect);
     return { point: { x: 100, y: 100 }, dir: 'down' };
@@ -103,6 +104,7 @@ vi.mock('@/app/reader/utils/transientHighlight', () => ({ showTransientHighlight
 vi.mock('@/app/reader/utils/annotatorUtil', () => ({ drawAnnotationOverlay: vi.fn() }));
 vi.mock('@/app/reader/utils/footnoteHeuristics', () => ({
   shouldCheckAsFootnote: () => false,
+  linksToDeclaredNote: () => false,
   isLinkTargetVisible: () => true,
 }));
 vi.mock('@/components/Overlay', () => ({ Overlay: () => <div /> }));

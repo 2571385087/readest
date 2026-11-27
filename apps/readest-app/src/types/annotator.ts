@@ -6,10 +6,12 @@ export type AnnotationToolType =
   | 'search'
   | 'dictionary'
   | 'contextdictionary'
+  | 'xray'
   | 'systemdictionary'
   | 'vocabulary'
   | 'translate'
   | 'tts'
   | 'proofread'
   | 'share'
+  | 'shareqr'
   | 'quotecard';

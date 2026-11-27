@@ -228,6 +228,7 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
     library: libraryBooks,
     libraryLoaded: libraryLoadedFromDisk,
     isSyncing,
+    isPullingLibrary,
     syncProgress,
     updateBook,
     updateBooks,
@@ -998,15 +999,15 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
     // casing must hash to the same key, so the in-place fast path in
     // importBook can recognize a re-import of the same file.
     const lookupIndex = buildBookLookupIndex(library, appService?.osPlatform);
-    const failedImports: Array<{ filename: string; errorMessage: string }> = [];
+    const failedImports: FailedImport[] = [];
     // Files the picker or drop skipped for their format are reported with this
-    // run's own failures, named together as their toast always did. A toast of
-    // their own was replaced by this run's success or failure toast (#6991).
+    // run's own failures, one row each so the dialog's count matches. A toast
+    // of their own was replaced by this run's success or failure toast (#6991).
     if (options.skipped?.length) {
-      failedImports.push({
-        filename: options.skipped.join(', '),
-        errorMessage: _(getImportErrorMessage('Unsupported format')),
-      });
+      const errorMessage = _(getImportErrorMessage('Unsupported format'));
+      for (const filename of options.skipped) {
+        failedImports.push({ filename, errorMessage });
+      }
     }
     const failedPaths: string[] = [];
     const successfulImports: string[] = [];
@@ -1983,6 +1984,9 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
     handleLibraryNavigation(group);
   };
 
+  const isWebPwa = appService?.appPlatform === 'web' && appService.hasSafeAreaInset;
+  const libraryBgClass = viewSettings?.isEink ? 'bg-base-100' : 'bg-base-200';
+
   if (
     !appService ||
     !insets ||
@@ -1990,7 +1994,7 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
     checkLastOpenBooks ||
     checkPendingLaunchLink
   ) {
-    return <div className='full-height bg-base-200' />;
+    return <div className={clsx('full-height bg-base-200', isWebPwa && 'fixed inset-0')} />;
   }
 
   const showBookshelf = libraryLoaded || libraryBooks.length > 0;
@@ -2001,12 +2005,13 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
       aria-label={_('Your Library')}
       className={clsx(
         'library-page text-base-content full-height flex select-none flex-col overflow-hidden',
-        viewSettings?.isEink ? 'bg-base-100' : 'bg-base-200',
+        libraryBgClass,
+        isWebPwa && 'fixed inset-0',
         appService?.hasRoundedWindow && isRoundedWindow && 'window-border rounded-window',
       )}
     >
       <div
-        className='relative top-0 z-40 w-full'
+        className={clsx('top-0 z-40 w-full', isWebPwa ? ['sticky', libraryBgClass] : 'relative')}
         role='banner'
         tabIndex={-1}
         aria-label={_('Library Header')}
@@ -2058,8 +2063,14 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
           max='100'
         />
       </div>
-      {(loading || isSyncing) && (
-        <div className='fixed inset-0 z-50 flex items-center justify-center'>
+      {(loading || isSyncing || isPullingLibrary) && (
+        <div
+          className={clsx(
+            'fixed inset-0 z-50 flex items-center justify-center',
+            // The pull alone can take minutes, or hang: keep the empty library usable meanwhile.
+            !loading && !isSyncing && 'pointer-events-none',
+          )}
+        >
           <Spinner loading />
         </div>
       )}
@@ -2287,7 +2298,7 @@ const LibraryPageContent = ({ searchParams }: { searchParams: ReadonlyURLSearchP
 
 const LibraryPage = () => {
   return (
-    <Suspense fallback={<div className='full-height' />}>
+    <Suspense fallback={<div className='full-height bg-base-200' />}>
       <LibraryPageWithSearchParams />
     </Suspense>
   );

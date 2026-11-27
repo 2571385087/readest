@@ -13,6 +13,7 @@ import type { AISettings } from '@/services/ai/types';
 import type { CoverSearchEngine } from '@/services/metadata/coverSearch';
 import type { NotebookTab } from '@/store/notebookStore';
 import type { DictionarySettings, ImportedDictionary } from '@/services/dictionaries/types';
+import type { AnkiProfileSettings } from '@/services/vocabulary/types';
 
 export type ThemeType = 'light' | 'dark' | 'auto';
 export type LibraryViewModeType = 'grid' | 'list';
@@ -67,6 +68,7 @@ export const LibraryGroupByType = {
 export type LibraryGroupByType = (typeof LibraryGroupByType)[keyof typeof LibraryGroupByType];
 
 export type KOSyncChecksumMethod = 'binary' | 'filename';
+export type KOSyncFilenameFormat = 'original' | 'author-title' | 'title-author';
 export type KOSyncStrategy = 'prompt' | 'silent' | 'send' | 'receive';
 
 export interface ReadSettings {
@@ -110,6 +112,11 @@ export interface KOSyncSettings {
   deviceId: string;
   deviceName: string;
   checksumMethod: KOSyncChecksumMethod;
+  /**
+   * The name the File Name checksum hashes for a book without a name of its
+   * own (`BookMetadata.kosyncFilename`). Unset means 'original'.
+   */
+  filenameFormat?: KOSyncFilenameFormat;
   strategy: KOSyncStrategy;
   customHeaders?: Record<string, string>;
   /**
@@ -283,6 +290,7 @@ export interface WebDAVSettings {
   syncProgress?: boolean;
   syncNotes?: boolean;
   syncBooks?: boolean;
+  syncFonts?: boolean;
   // When true, "Sync now" re-checks every book instead of only those whose
   // local copy differs from the shared library.json index (the default
   // incremental walk). An escape hatch for drift or a first full sync.
@@ -317,6 +325,7 @@ export interface GoogleDriveSettings {
   syncProgress?: boolean;
   syncNotes?: boolean;
   syncBooks?: boolean;
+  syncFonts?: boolean;
   fullSync?: boolean;
   strategy?: KOSyncStrategy;
   deviceId?: string;
@@ -345,6 +354,7 @@ export interface S3Settings {
   syncProgress?: boolean;
   syncNotes?: boolean;
   syncBooks?: boolean;
+  syncFonts?: boolean;
   fullSync?: boolean;
   strategy?: KOSyncStrategy;
   deviceId?: string;
@@ -367,6 +377,7 @@ export interface OneDriveSettings {
   syncProgress?: boolean;
   syncNotes?: boolean;
   syncBooks?: boolean;
+  syncFonts?: boolean;
   fullSync?: boolean;
   strategy?: KOSyncStrategy;
   deviceId?: string;
@@ -386,6 +397,7 @@ export interface ICloudSettings {
   syncProgress?: boolean;
   syncNotes?: boolean;
   syncBooks?: boolean;
+  syncFonts?: boolean;
   fullSync?: boolean;
   strategy?: KOSyncStrategy;
   deviceId?: string;
@@ -583,6 +595,9 @@ export interface SystemSettings {
   /** Ordered list of unique metadata sort criteria (highest priority first) with per-criterion direction. */
   librarySortOrder?: LibrarySortCriterion[];
   libraryGroupBy: LibraryGroupByType;
+  /** Whether the View menu's Group by... and Sort by... sections open expanded (#7893). */
+  libraryGroupByExpanded: boolean;
+  librarySortByExpanded: boolean;
   libraryCoverFit: LibraryCoverFitType;
   libraryAutoColumns: boolean;
   libraryColumns: number;
@@ -611,6 +626,8 @@ export interface SystemSettings {
   customTextures: CustomTexture[];
   customDictionaries: ImportedDictionary[];
   dictionarySettings: DictionarySettings;
+  /** The card profiles Sync with Anki uses (#7849); Readest's own cards without one. */
+  ankiProfiles?: AnkiProfileSettings;
   opdsCatalogs: OPDSCatalog[];
   absServers: ABSServer[];
   /** User-configured translation backends; synced as `custom_translator`. */
